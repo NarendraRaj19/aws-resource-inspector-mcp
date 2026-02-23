@@ -1,0 +1,42 @@
+notepad .gitignore
+```
+
+**Paste this content:**
+```
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+
+# Logs
+*.log
+debug.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AWS credentials (NEVER commit these)
+.aws/
+credentials
+
+# MCP specific
+*.db
