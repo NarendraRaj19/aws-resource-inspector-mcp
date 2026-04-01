@@ -94,6 +94,50 @@ async def list_tools() -> list[Tool]:
                 "required": ["tag_key", "tag_value"],
             },
         ),
+        Tool(
+            name="get_ec2_cpu_metrics",
+            description="Get CPU utilization metrics for EC2 instances over a specified time period. Shows average, maximum, and minimum CPU usage.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instance_id": {
+                        "type": "string",
+                        "description": "EC2 instance ID (e.g., i-1234567890abcdef0)",
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "AWS region. If not specified, uses default region.",
+                    },
+                    "hours": {
+                        "type": "integer",
+                        "description": "Number of hours of historical data to retrieve (default: 24, max: 168 for 7 days)",
+                    },
+                },
+                "required": ["instance_id"],
+            },
+        ),
+        Tool(
+            name="get_lambda_metrics",
+            description="Get invocation metrics for a Lambda function. Shows invocation count, errors, duration, and throttles over a specified time period.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "function_name": {
+                        "type": "string",
+                        "description": "Lambda function name",
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "AWS region. If not specified, uses default region.",
+                    },
+                    "hours": {
+                        "type": "integer",
+                        "description": "Number of hours of historical data to retrieve (default: 24)",
+                    },
+                },
+                "required": ["function_name"],
+            },
+        ),
     ]
 
 
@@ -111,6 +155,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return await get_cost_analysis(arguments)
         elif name == "search_resources_by_tag":
             return await search_resources_by_tag(arguments)
+        elif name == "get_ec2_cpu_metrics":
+            return await get_ec2_cpu_metrics(arguments)
+        elif name == "get_lambda_metrics":
+            return await get_lambda_metrics(arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
     except ClientError as e:
@@ -391,6 +439,179 @@ async def search_resources_by_tag(arguments: dict) -> list[TextContent]:
 
     return [TextContent(type="text", text=result)]
 
+async def get_ec2_cpu_metrics(arguments: dict) -> list[TextContent]:
+    """Get CPU utilization metrics for an EC2 instance."""
+    from datetime import datetime, timedelta
+
+    instance_id = arguments.get("instance_id")
+    region = arguments.get("region")
+    hours = arguments.get("hours", 24)
+
+    # Limit to 7 days
+    if hours > 168:
+        hours = 168
+
+    cloudwatch = get_aws_client("cloudwatch", region)
+
+    # Calculate time range
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(hours=hours)
+
+    try:
+        # Get CPU utilization metrics
+        response = cloudwatch.get_metric_statistics(
+            Namespace='AWS/EC2',
+            MetricName='CPUUtilization',
+            Dimensions=[
+                {
+                    'Name': 'InstanceId',
+                    'Value': instance_id
+                }
+            ],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=3600,  # 1 hour intervals
+            Statistics=['Average', 'Maximum', 'Minimum']
+        )
+
+        if not response['Datapoints']:
+            return [TextContent(
+                type="text",
+                text=f"No CPU metrics found for instance {instance_id} in the last {hours} hours. Instance may be stopped or metrics not available yet."
+            )]
+
+        # Sort by timestamp
+        datapoints = sorted(response['Datapoints'], key=lambda x: x['Timestamp'])
+
+        # Calculate overall statistics
+        avg_cpu = sum(d['Average'] for d in datapoints) / len(datapoints)
+        max_cpu = max(d['Maximum'] for d in datapoints)
+        min_cpu = min(d['Minimum'] for d in datapoints)
+
+        result = f"EC2 CPU Metrics for {instance_id}\n"
+        result += f"{'=' * 50}\n\n"
+        result += f"Time Range: Last {hours} hours\n"
+        result += f"Data Points: {len(datapoints)}\n\n"
+        result += f"Overall Statistics:\n"
+        result += f"  Average CPU: {avg_cpu:.2f}%\n"
+        result += f"  Maximum CPU: {max_cpu:.2f}%\n"
+        result += f"  Minimum CPU: {min_cpu:.2f}%\n\n"
+
+        # Show recent data points
+        result += f"Recent CPU Usage (hourly):\n\n"
+
+        for dp in datapoints[-24:]:  # Last 24 data points
+            timestamp = dp['Timestamp'].strftime('%Y-%m-%d %H:%M UTC')
+            avg = dp['Average']
+            result += f"  {timestamp}: {avg:.2f}% (max: {dp['Maximum']:.2f}%, min: {dp['Minimum']:.2f}%)\n"
+
+        return [TextContent(type="text", text=result)]
+
+    except ClientError as e:
+        return [TextContent(
+            type="text",
+            text=f"Error getting metrics: {e.response['Error']['Message']}"
+        )]
+
+
+async def get_lambda_metrics(arguments: dict) -> list[TextContent]:
+    """Get metrics for a Lambda function."""
+    from datetime import datetime, timedelta
+
+    function_name = arguments.get("function_name")
+    region = arguments.get("region")
+    hours = arguments.get("hours", 24)
+
+    cloudwatch = get_aws_client("cloudwatch", region)
+
+    # Calculate time range
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(hours=hours)
+
+    metrics_to_fetch = [
+        ('Invocations', 'Sum'),
+        ('Errors', 'Sum'),
+        ('Duration', 'Average'),
+        ('Throttles', 'Sum'),
+        ('ConcurrentExecutions', 'Maximum')
+    ]
+
+    results = {}
+
+    for metric_name, stat in metrics_to_fetch:
+        try:
+            response = cloudwatch.get_metric_statistics(
+                Namespace='AWS/Lambda',
+                MetricName=metric_name,
+                Dimensions=[
+                    {
+                        'Name': 'FunctionName',
+                        'Value': function_name
+                    }
+                ],
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=3600,  # 1 hour intervals
+                Statistics=[stat]
+            )
+
+            if response['Datapoints']:
+                datapoints = sorted(response['Datapoints'], key=lambda x: x['Timestamp'])
+                results[metric_name] = {
+                    'datapoints': datapoints,
+                    'stat': stat
+                }
+        except ClientError:
+            pass
+
+    if not results:
+        return [TextContent(
+            type="text",
+            text=f"No metrics found for Lambda function '{function_name}' in the last {hours} hours."
+        )]
+
+    # Build result
+    result = f"Lambda Metrics for {function_name}\n"
+    result += f"{'=' * 50}\n\n"
+    result += f"Time Range: Last {hours} hours\n\n"
+
+    # Summary statistics
+    if 'Invocations' in results:
+        total_invocations = sum(d['Sum'] for d in results['Invocations']['datapoints'])
+        result += f"Total Invocations: {int(total_invocations)}\n"
+
+    if 'Errors' in results:
+        total_errors = sum(d['Sum'] for d in results['Errors']['datapoints'])
+        result += f"Total Errors: {int(total_errors)}\n"
+
+        if 'Invocations' in results and total_invocations > 0:
+            error_rate = (total_errors / total_invocations) * 100
+            result += f"Error Rate: {error_rate:.2f}%\n"
+
+    if 'Duration' in results:
+        avg_duration = sum(d['Average'] for d in results['Duration']['datapoints']) / len(
+            results['Duration']['datapoints'])
+        result += f"Average Duration: {avg_duration:.2f} ms\n"
+
+    if 'Throttles' in results:
+        total_throttles = sum(d['Sum'] for d in results['Throttles']['datapoints'])
+        result += f"Total Throttles: {int(total_throttles)}\n"
+
+    if 'ConcurrentExecutions' in results:
+        max_concurrent = max(d['Maximum'] for d in results['ConcurrentExecutions']['datapoints'])
+        result += f"Max Concurrent Executions: {int(max_concurrent)}\n"
+
+    result += f"\n{'=' * 50}\n"
+    result += "\nHourly Breakdown:\n\n"
+
+    # Show invocations per hour
+    if 'Invocations' in results:
+        for dp in results['Invocations']['datapoints'][-24:]:
+            timestamp = dp['Timestamp'].strftime('%Y-%m-%d %H:%M UTC')
+            invocations = int(dp['Sum'])
+            result += f"  {timestamp}: {invocations} invocations\n"
+
+    return [TextContent(type="text", text=result)]
 
 async def main():
     """Run the MCP server."""
