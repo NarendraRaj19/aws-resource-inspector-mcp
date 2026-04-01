@@ -6,6 +6,8 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
+from utils.formatters import format_table, status_indicator, format_timestamp
+from utils.formatters import format_cost, format_summary
 
 # Initialize MCP server
 app = Server("aws-resource-inspector")
@@ -169,7 +171,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
-
 async def list_ec2_instances(arguments: dict) -> list[TextContent]:
     """List EC2 instances."""
     region = arguments.get("region")
@@ -188,8 +189,10 @@ async def list_ec2_instances(arguments: dict) -> list[TextContent]:
     else:
         response = ec2.describe_instances()
 
-    # Format response
-    instances = []
+    # Format as table
+    headers = ["Instance ID", "Name", "Type", "State", "AZ", "Private IP", "Public IP"]
+    rows = []
+
     for reservation in response["Reservations"]:
         for instance in reservation["Instances"]:
             # Get instance name from tags
@@ -199,22 +202,21 @@ async def list_ec2_instances(arguments: dict) -> list[TextContent]:
                     name = tag["Value"]
                     break
 
-            instances.append({
-                "InstanceId": instance["InstanceId"],
-                "Name": name,
-                "InstanceType": instance["InstanceType"],
-                "State": instance["State"]["Name"],
-                "LaunchTime": instance["LaunchTime"].isoformat(),
-                "AvailabilityZone": instance["Placement"]["AvailabilityZone"],
-                "PrivateIpAddress": instance.get("PrivateIpAddress", "N/A"),
-                "PublicIpAddress": instance.get("PublicIpAddress", "N/A"),
-            })
+            rows.append([
+                instance["InstanceId"],
+                name,
+                instance["InstanceType"],
+                status_indicator(instance["State"]["Name"]),
+                instance["Placement"]["AvailabilityZone"],
+                instance.get("PrivateIpAddress", "N/A"),
+                instance.get("PublicIpAddress", "N/A"),
+            ])
 
-    if not instances:
+    if not rows:
         result = f"No EC2 instances found in region {region or 'default'}."
     else:
-        result = f"Found {len(instances)} EC2 instance(s):\n\n"
-        result += json.dumps(instances, indent=2)
+        title = f"EC2 Instances in {region or 'default region'} ({len(rows)} found)"
+        result = format_table(headers, rows, title)
 
     return [TextContent(type="text", text=result)]
 
@@ -226,7 +228,9 @@ async def list_s3_buckets(arguments: dict) -> list[TextContent]:
     # List buckets
     response = s3.list_buckets()
 
-    buckets = []
+    headers = ["Bucket Name", "Region", "Created"]
+    rows = []
+
     for bucket in response["Buckets"]:
         bucket_name = bucket["Name"]
 
@@ -237,17 +241,17 @@ async def list_s3_buckets(arguments: dict) -> list[TextContent]:
         except ClientError:
             region = "Unknown"
 
-        buckets.append({
-            "Name": bucket_name,
-            "CreationDate": bucket["CreationDate"].isoformat(),
-            "Region": region,
-        })
+        rows.append([
+            bucket_name,
+            region,
+            format_timestamp(bucket["CreationDate"]),
+        ])
 
-    if not buckets:
+    if not rows:
         result = "No S3 buckets found."
     else:
-        result = f"Found {len(buckets)} S3 bucket(s):\n\n"
-        result += json.dumps(buckets, indent=2)
+        title = f"S3 Buckets ({len(rows)} found)"
+        result = format_table(headers, rows, title)
 
     return [TextContent(type="text", text=result)]
 
@@ -259,34 +263,33 @@ async def list_lambda_functions(arguments: dict) -> list[TextContent]:
     lambda_client = get_aws_client("lambda", region)
 
     # List functions
-    functions = []
+    headers = ["Function Name", "Runtime", "Memory (MB)", "Timeout (s)", "Last Modified"]
+    rows = []
+
     paginator = lambda_client.get_paginator('list_functions')
 
     for page in paginator.paginate():
         for func in page['Functions']:
-            functions.append({
-                "FunctionName": func["FunctionName"],
-                "Runtime": func.get("Runtime", "N/A"),
-                "MemorySize": func["MemorySize"],
-                "Timeout": func["Timeout"],
-                "LastModified": func["LastModified"],
-                "CodeSize": func["CodeSize"],
-                "Handler": func["Handler"],
-                "Description": func.get("Description", "N/A"),
-            })
+            rows.append([
+                func["FunctionName"],
+                func.get("Runtime", "N/A"),
+                func["MemorySize"],
+                func["Timeout"],
+                format_timestamp(func["LastModified"]),
+            ])
 
-    if not functions:
+    if not rows:
         result = f"No Lambda functions found in region {region or 'default'}."
     else:
-        result = f"Found {len(functions)} Lambda function(s):\n\n"
-        result += json.dumps(functions, indent=2)
+        title = f"Lambda Functions in {region or 'default region'} ({len(rows)} found)"
+        result = format_table(headers, rows, title)
 
     return [TextContent(type="text", text=result)]
 
 
 async def get_cost_analysis(arguments: dict) -> list[TextContent]:
     """Get current month's AWS costs."""
-    from datetime import datetime, timedelta
+    from datetime import datetime
 
     ce = get_aws_client("ce", "us-east-1")  # Cost Explorer is only in us-east-1
 
@@ -313,7 +316,8 @@ async def get_cost_analysis(arguments: dict) -> list[TextContent]:
         )
 
         # Parse results
-        costs = []
+        headers = ["Service", "Cost"]
+        rows = []
         total_cost = 0
 
         if response['ResultsByTime']:
@@ -322,27 +326,27 @@ async def get_cost_analysis(arguments: dict) -> list[TextContent]:
                 amount = float(group['Metrics']['UnblendedCost']['Amount'])
 
                 if amount > 0.01:  # Only show services with meaningful costs
-                    costs.append({
-                        "Service": service,
-                        "Cost": f"${amount:.2f}",
-                        "Amount": amount
-                    })
+                    rows.append([
+                        service,
+                        format_cost(amount)
+                    ])
                     total_cost += amount
 
-        # Sort by cost (highest first)
-        costs.sort(key=lambda x: x['Amount'], reverse=True)
+        # Sort by cost (extract numeric value for sorting)
+        rows.sort(key=lambda x: float(x[1].replace('$', '')), reverse=True)
 
-        # Remove the Amount field (only used for sorting)
-        for cost in costs:
-            del cost['Amount']
-
-        if not costs:
+        if not rows:
             result = "No costs found for the current month."
         else:
-            result = f"AWS Costs for {start_of_month} to {end_of_today}\n"
-            result += f"Total: ${total_cost:.2f}\n\n"
-            result += f"Top {min(10, len(costs))} Services:\n\n"
-            result += json.dumps(costs[:10], indent=2)
+            summary_stats = {
+                "Period": f"{start_of_month} to {end_of_today}",
+                "Total Cost": format_cost(total_cost),
+                "Services": len(rows)
+            }
+
+            result = format_summary("AWS Cost Analysis", summary_stats)
+            result += "\n\n"
+            result += format_table(headers, rows[:10], "Top 10 Services by Cost")  # Limit to top 10
 
         return [TextContent(type="text", text=result)]
 
@@ -353,7 +357,6 @@ async def get_cost_analysis(arguments: dict) -> list[TextContent]:
                 text="Cost Explorer access denied. You need 'ce:GetCostAndUsage' permission or enable Cost Explorer in AWS console."
             )]
         raise
-
 
 async def search_resources_by_tag(arguments: dict) -> list[TextContent]:
     """Search resources by tag."""
