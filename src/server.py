@@ -140,6 +140,37 @@ async def list_tools() -> list[Tool]:
                 "required": ["function_name"],
             },
         ),
+        Tool(
+            name="list_dynamodb_tables",
+            description="List all DynamoDB tables with their basic information (name, status, item count, size).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "region": {
+                        "type": "string",
+                        "description": "AWS region. If not specified, uses default region.",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="get_dynamodb_table_details",
+            description="Get detailed information about a specific DynamoDB table including schema, indexes, capacity, and metrics.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_name": {
+                        "type": "string",
+                        "description": "DynamoDB table name",
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "AWS region. If not specified, uses default region.",
+                    },
+                },
+                "required": ["table_name"],
+            },
+        ),
     ]
 
 
@@ -161,6 +192,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return await get_ec2_cpu_metrics(arguments)
         elif name == "get_lambda_metrics":
             return await get_lambda_metrics(arguments)
+        elif name == "list_dynamodb_tables":
+            return await list_dynamodb_tables(arguments)
+        elif name == "get_dynamodb_table_details":
+            return await get_dynamodb_table_details(arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
     except ClientError as e:
@@ -615,6 +650,181 @@ async def get_lambda_metrics(arguments: dict) -> list[TextContent]:
             result += f"  {timestamp}: {invocations} invocations\n"
 
     return [TextContent(type="text", text=result)]
+
+async def list_dynamodb_tables(arguments: dict) -> list[TextContent]:
+    """List DynamoDB tables."""
+    region = arguments.get("region")
+
+    dynamodb = get_aws_client("dynamodb", region)
+
+    # List tables
+    try:
+        response = dynamodb.list_tables()
+        table_names = response.get('TableNames', [])
+
+        if not table_names:
+            return [TextContent(
+                type="text",
+                text=f"No DynamoDB tables found in region {region or 'default'}."
+            )]
+
+        # Get details for each table
+        headers = ["Table Name", "Status", "Item Count", "Table Size", "Billing Mode"]
+        rows = []
+
+        for table_name in table_names:
+            try:
+                table_info = dynamodb.describe_table(TableName=table_name)
+                table = table_info['Table']
+
+                rows.append([
+                    table['TableName'],
+                    status_indicator(table['TableStatus']),
+                    f"{table.get('ItemCount', 0):,}",
+                    format_bytes(table.get('TableSizeBytes', 0)),
+                    table.get('BillingModeSummary', {}).get('BillingMode', 'PROVISIONED'),
+                ])
+            except ClientError as e:
+                rows.append([
+                    table_name,
+                    f"❌ Error: {e.response['Error']['Code']}",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                ])
+
+        title = f"DynamoDB Tables in {region or 'default region'} ({len(rows)} found)"
+        result = format_table(headers, rows, title)
+
+        return [TextContent(type="text", text=result)]
+
+    except ClientError as e:
+        return [TextContent(
+            type="text",
+            text=f"Error listing DynamoDB tables: {e.response['Error']['Message']}"
+        )]
+
+
+async def get_dynamodb_table_details(arguments: dict) -> list[TextContent]:
+    """Get detailed information about a DynamoDB table."""
+    table_name = arguments.get("table_name")
+    region = arguments.get("region")
+
+    dynamodb = get_aws_client("dynamodb", region)
+
+    try:
+        response = dynamodb.describe_table(TableName=table_name)
+        table = response['Table']
+
+        result = f"\nDynamoDB Table Details: {table_name}\n"
+        result += "=" * 60 + "\n\n"
+
+        # Basic Info
+        result += "Basic Information:\n"
+        result += f"  Status: {status_indicator(table['TableStatus'])}\n"
+        result += f"  Creation Date: {format_timestamp(table['CreationDateTime'])}\n"
+        result += f"  Item Count: {table.get('ItemCount', 0):,}\n"
+        result += f"  Table Size: {format_bytes(table.get('TableSizeBytes', 0))}\n"
+        result += f"  Table ARN: {table['TableArn']}\n\n"
+
+        # Billing Mode
+        billing_mode = table.get('BillingModeSummary', {}).get('BillingMode', 'PROVISIONED')
+        result += f"Billing Mode: {billing_mode}\n"
+
+        if billing_mode == 'PROVISIONED':
+            provisioned = table.get('ProvisionedThroughput', {})
+            result += f"  Read Capacity: {provisioned.get('ReadCapacityUnits', 0)} RCU\n"
+            result += f"  Write Capacity: {provisioned.get('WriteCapacityUnits', 0)} WCU\n"
+        result += "\n"
+
+        # Key Schema
+        result += "Key Schema:\n"
+        for key in table['KeySchema']:
+            key_type = "Partition Key" if key['KeyType'] == 'HASH' else "Sort Key"
+
+            # Find attribute type
+            attr_type = "Unknown"
+            for attr in table['AttributeDefinitions']:
+                if attr['AttributeName'] == key['AttributeName']:
+                    attr_type = attr['AttributeType']
+                    break
+
+            result += f"  {key_type}: {key['AttributeName']} ({attr_type})\n"
+        result += "\n"
+
+        # Global Secondary Indexes
+        gsi = table.get('GlobalSecondaryIndexes', [])
+        if gsi:
+            result += f"Global Secondary Indexes ({len(gsi)}):\n"
+            for index in gsi:
+                result += f"  • {index['IndexName']}\n"
+                result += f"    Status: {status_indicator(index['IndexStatus'])}\n"
+                result += f"    Item Count: {index.get('ItemCount', 0):,}\n"
+
+                if billing_mode == 'PROVISIONED':
+                    idx_provisioned = index.get('ProvisionedThroughput', {})
+                    result += f"    Read Capacity: {idx_provisioned.get('ReadCapacityUnits', 0)} RCU\n"
+                    result += f"    Write Capacity: {idx_provisioned.get('WriteCapacityUnits', 0)} WCU\n"
+            result += "\n"
+
+        # Local Secondary Indexes
+        lsi = table.get('LocalSecondaryIndexes', [])
+        if lsi:
+            result += f"Local Secondary Indexes ({len(lsi)}):\n"
+            for index in lsi:
+                result += f"  • {index['IndexName']}\n"
+                result += f"    Item Count: {index.get('ItemCount', 0):,}\n"
+            result += "\n"
+
+        # Stream Specification
+        stream = table.get('StreamSpecification')
+        if stream and stream.get('StreamEnabled'):
+            result += "DynamoDB Streams:\n"
+            result += f"  Enabled: ✅ Yes\n"
+            result += f"  View Type: {stream.get('StreamViewType', 'N/A')}\n"
+            result += f"  Stream ARN: {table.get('LatestStreamArn', 'N/A')}\n\n"
+
+        # Encryption
+        sse = table.get('SSEDescription')
+        if sse:
+            result += "Encryption:\n"
+            result += f"  Status: {status_indicator(sse.get('Status', 'UNKNOWN'))}\n"
+            result += f"  Type: {sse.get('SSEType', 'N/A')}\n\n"
+
+        # Point-in-time Recovery
+        try:
+            pitr_response = dynamodb.describe_continuous_backups(TableName=table_name)
+            pitr_status = pitr_response['ContinuousBackupsDescription']['PointInTimeRecoveryDescription'][
+                'PointInTimeRecoveryStatus']
+            result += "Point-in-Time Recovery:\n"
+            result += f"  Status: {status_indicator(pitr_status)}\n\n"
+        except ClientError:
+            pass
+
+        # Tags
+        try:
+            tags_response = dynamodb.list_tags_of_resource(ResourceArn=table['TableArn'])
+            tags = tags_response.get('Tags', [])
+            if tags:
+                result += f"Tags ({len(tags)}):\n"
+                for tag in tags:
+                    result += f"  {tag['Key']}: {tag['Value']}\n"
+                result += "\n"
+        except ClientError:
+            pass
+
+        return [TextContent(type="text", text=result)]
+
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            return [TextContent(
+                type="text",
+                text=f"Table '{table_name}' not found in region {region or 'default'}."
+            )]
+        return [TextContent(
+            type="text",
+            text=f"Error getting table details: {e.response['Error']['Message']}"
+        )]
 
 async def main():
     """Run the MCP server."""
