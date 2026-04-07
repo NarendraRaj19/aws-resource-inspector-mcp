@@ -200,21 +200,6 @@ Your AWS IAM user/role needs these permissions:
 }
 ```
 
-## Roadmap
-
-### Day 2 (Planned)
-- [ ] Security audit features (public S3 buckets, open security groups)
-  - [ ] CloudWatch metrics integration
-  - [ ] RDS database inspection
-  - [ ] Response formatting improvements
-  - [ ] Caching layer to reduce API calls
-
-### Future Enhancements
-- [ ] Historical cost trends
-  - [ ] Resource optimization suggestions
-  - [ ] Multi-account support
-  - [ ] Export results to CSV/JSON
-
 ## Technical Details
 
 - **Language**: Python 3.14
